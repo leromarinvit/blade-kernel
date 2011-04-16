@@ -24,6 +24,7 @@
 #include <linux/platform_device.h>
 #include <linux/synaptics_i2c_rmi.h>
 #include <mach/gpio.h>
+#include <asm/uaccess.h>
 
 #if defined(CONFIG_MACH_BLADE)
 #define GPIO_TOUCH_EN_OUT  31
@@ -84,6 +85,7 @@ struct synaptics_ts_data
 	uint16_t max[2];
 	struct early_suspend early_suspend;
 	uint32_t dup_threshold;
+	int is_suspended;
 };
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
@@ -271,6 +273,313 @@ static int synaptics_ts_reset(struct i2c_client *client)
 		return -1;
 
 	return 0;
+}
+
+static int proc_read_config(char *page, char **start, off_t off, int count,
+		int *eof, void *tsdata)
+{
+	char *config, blid[2], buf;
+	int ret, err, data, query, i, len;
+	struct synaptics_ts_data *ts = tsdata;
+	struct i2c_client *client = ts->client;
+	unsigned short blocksize, blockcount;
+
+	if (ts->is_suspended) {
+		printk(KERN_WARNING "synaptics_i2c_rmi: Can't access device while suspended\n");
+		return -EBUSY;
+	}
+	ret = synaptics_ts_get_func_addr(client, 0x34, &data, NULL, NULL, &query);
+	if (ret)
+		return -EIO;
+	disable_irq(client->irq);
+	err = -EIO;
+	ret = synaptics_i2c_read(client, query + 3, (u8 *) &blocksize, 2);
+	if (ret)
+		goto err_irq;
+	blocksize = __le16_to_cpu(blocksize);
+	ret = synaptics_i2c_read(client, query + 7, (u8 *) &blockcount, 2);
+	if (ret)
+		goto err_irq;
+	blockcount = __le16_to_cpu(blockcount);
+	printk(KERN_INFO "synaptics_i2c_rmi: Flash block size = %u, count = %u\n",
+			blocksize, blockcount);
+	len = blocksize * blockcount;
+	config = kmalloc(len, GFP_KERNEL);
+	if (!config) {
+		err = -ENOMEM;
+		goto err_irq;
+	}
+	ret = synaptics_i2c_read(client, query, blid, 2);
+	if (ret)
+		goto err_free;
+	ret = synaptics_i2c_write(client, data + 2, blid[0]);
+	if (ret)
+		goto err_free;
+	ret = synaptics_i2c_write(client, data + 3, blid[1]);
+	if (ret)
+		goto err_free;
+	ret = synaptics_i2c_write(client, data + blocksize + 2, 0x0F);
+	if (ret)
+		goto err_reset;
+	do {
+		msleep(10);
+		ret = synaptics_ts_get_func_addr(client, 0x34, &data, NULL, NULL, &query);
+		if (ret)
+			goto err_reset;
+		ret = synaptics_i2c_read(client, data + blocksize + 2, &buf, 1);
+		if (ret)
+			goto err_reset;
+	} while (buf & 0x0F);
+	if (buf != 0x80)
+		goto err_reset;
+	ret = synaptics_i2c_write(client, data, 0);
+	if (ret)
+		goto err_reset;
+	ret = synaptics_i2c_write(client, data + 1, 0);
+	if (ret)
+		goto err_reset;
+	for (i = 0; i < blockcount; i++) {
+		ret = synaptics_i2c_write(client, data + blocksize + 2, 5);
+		if (ret)
+			goto err_reset;
+		do {
+			msleep(10);
+			ret = synaptics_i2c_read(client, data + blocksize + 2, &buf, 1);
+			if (ret)
+				goto err_reset;
+		} while (buf & 0x0F);
+		if (buf != 0x80)
+			goto err_reset;
+		ret = synaptics_i2c_read(client, data + 2, &config[blocksize * i], blocksize);
+		if (ret)
+			goto err_reset;
+	}
+
+	if (off >= len) {
+		err = 0;
+		*eof = 1;
+	} else if (off + count >= len) {
+		*eof = 1;
+		memcpy(page, config + off, len - off);
+		err = len - off;
+	} else {
+		memcpy(page, config + off, count);
+		err = count;
+	}
+
+err_reset:
+	synaptics_ts_reset(client);
+err_free:
+	kfree(config);
+err_irq:
+	enable_irq(client->irq);
+	return err;
+}
+
+/* ripped straight from Wikipedia */
+uint32_t fletcher32( uint16_t *data, size_t len )
+{
+        uint32_t sum1 = 0xffff, sum2 = 0xffff;
+
+        while (len) {
+                unsigned tlen = len > 360 ? 360 : len;
+                len -= tlen;
+                do {
+                        sum1 += __le32_to_cpu(*data++);
+                        sum2 += sum1;
+                } while (--tlen);
+                sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+                sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+        }
+        /* Second reduction step to reduce sums to 16 bits */
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+        return sum2 << 16 | sum1;
+}
+
+static int proc_write_config(struct file *file, const char *buffer,
+           unsigned long count, void *tsdata)
+{
+	struct synaptics_ts_data *ts = tsdata;
+	struct i2c_client *client = ts->client;
+	int ret, err, data, query, i, j, len;
+	char buf, *config, blid[2];
+	unsigned long checksum, checksum2;
+	unsigned short blocksize, blockcount;
+
+	if (ts->is_suspended) {
+		printk(KERN_WARNING "synaptics_i2c_rmi: Can't access device while suspended\n");
+		return -EBUSY;
+	}
+	ret = synaptics_ts_get_func_addr(client, 0x34, &data, NULL, NULL, &query);
+	if (ret)
+		return -EIO;
+	disable_irq(client->irq);
+	err = -EIO;
+	ret = synaptics_i2c_read(client, query + 3, (u8 *) &blocksize, 2);
+	if (ret)
+		goto err_irq;
+	blocksize = __le16_to_cpu(blocksize);
+	ret = synaptics_i2c_read(client, query + 7, (u8 *) &blockcount, 2);
+	if (ret)
+		goto err_irq;
+	blockcount = __le16_to_cpu(blockcount);
+	printk(KERN_INFO "synaptics_i2c_rmi: Flash block size = %u, count = %u\n",
+			blocksize, blockcount);
+	len = blocksize * blockcount;
+	config = kmalloc(len, GFP_KERNEL);
+	if (!config) {
+		err = -ENOMEM;
+		goto err_irq;
+	}
+	if (count != len) {
+		printk(KERN_ERR "synaptics_i2c_rmi: Configuration data must be %u bytes long, not updating\n", len);
+		err = -EINVAL;
+		goto err_free;
+	}
+	if (copy_from_user(config, buffer, len)) {
+		err = -EFAULT;
+		goto err_free;
+	}
+	checksum = fletcher32((uint16_t *) config, (len - 4) / 2);
+	memcpy(&checksum2, &config[len - 4], 4);
+	if (checksum != __le32_to_cpu(checksum2)) {
+		printk(KERN_ERR "synaptics_i2c_rmi: Checksum mismatch , not updating configuration\n");
+		err = -EINVAL;
+		goto err_free;
+	}
+	ret = synaptics_i2c_read(client, query, blid, 2);
+	if (ret)
+		goto err_free;
+	ret = synaptics_i2c_write(client, data + 2, blid[0]);
+	if (ret)
+		goto err_free;
+	ret = synaptics_i2c_write(client, data + 3, blid[1]);
+	if (ret)
+		goto err_free;
+	ret = synaptics_i2c_write(client, data + blocksize + 2, 0x0F);
+	if (ret)
+		goto err_reset;
+	do {
+		msleep(10);
+		ret = synaptics_ts_get_func_addr(client, 0x34, &data, NULL, NULL, &query);
+		if (ret)
+			goto err_reset;
+		ret = synaptics_i2c_read(client, data + blocksize + 2, &buf, 1);
+		if (ret)
+			goto err_reset;
+	} while (buf & 0x0F);
+	if (buf != 0x80)
+		goto err_reset;
+	ret = synaptics_i2c_write(client, data + 2, blid[0]);
+	if (ret)
+		goto err_reset;
+	ret = synaptics_i2c_write(client, data + 3, blid[1]);
+	if (ret)
+		goto err_reset;
+	ret = synaptics_i2c_write(client, data + blocksize + 2, 7);
+	if (ret)
+		goto err_reset;
+	do {
+		msleep(10);
+		ret = synaptics_i2c_read(client, data + blocksize + 2, &buf, 1);
+		if (ret)
+			goto err_reset;
+	} while (buf & 0x0F);
+	if (buf != 0x80)
+		goto err_reset;
+	ret = synaptics_i2c_write(client, data, 0);
+	if (ret)
+		goto err_reset;
+	ret = synaptics_i2c_write(client, data + 1, 0);
+	if (ret)
+		goto err_reset;
+	for (i = 0; i < blockcount; i++) {
+		for (j = 0; j < blocksize; j++) {
+			ret = synaptics_i2c_write(client, data + 2 + j, config[blocksize * i + j]);
+			if (ret)
+				goto err_reset;
+		}
+		ret = synaptics_i2c_write(client, data + blocksize + 2, 6);
+		if (ret)
+			goto err_reset;
+		do {
+			msleep(10);
+			ret = synaptics_i2c_read(client, data + blocksize + 2, &buf, 1);
+			if (ret)
+				goto err_reset;
+		} while (buf & 0x0F);
+		if (buf != 0x80)
+			goto err_reset;
+	}
+	printk(KERN_INFO "synaptics_i2c_rmi: Configuration successfully updated\n");
+	err = count;
+
+err_reset:
+	synaptics_ts_reset(client);
+err_free:
+	kfree(config);
+err_irq:
+	enable_irq(client->irq);
+	if (err < 0)
+		printk(KERN_ERR "synaptics_i2c_rmi: Failed to update configuration\n");
+	return err;
+}
+
+static int proc_read_pdt(char *page, char **start, off_t off, int count,
+		int *eof, void *tsdata)
+{
+	struct synaptics_ts_data *ts = tsdata;
+	struct i2c_client *client = ts->client;
+	int addr = CONFIG_TOUCHSCREEN_SYNAPTICS_I2C_RMI_PDT;
+	char ret, func, irqs, data, ctrl, cmd, query;
+	char buf[1000];
+	int len = 0;
+
+	if (ts->is_suspended) {
+		printk(KERN_WARNING "synaptics_i2c_rmi: Can't access device while suspended\n");
+		return -EBUSY;
+	}
+	ret = synaptics_i2c_read(client, addr, &data, 1);
+	if (data & 0x40)
+		len = snprintf(buf, len, "Non-standard Page Select Register\n");
+	addr--;
+	ret = synaptics_i2c_read(client, addr, &func, 1);
+	if (ret)
+		return -EIO;
+	while (func) {
+		ret = synaptics_i2c_read(client, addr - 1, &irqs, 1);
+		ret |= synaptics_i2c_read(client, addr - 2, &data, 1);
+		ret |= synaptics_i2c_read(client, addr - 3, &ctrl, 1);
+		ret |= synaptics_i2c_read(client, addr - 4, &cmd, 1);
+		ret |= synaptics_i2c_read(client, addr - 5, &query, 1);
+		if (ret)
+			return -EIO;
+		len += snprintf(buf + len, sizeof(buf) - len,
+				"F$%02X (version %d): %d interrupt(s), data=0x%02X ctrl=0x%02X cmd=0x%02X query=0x%02X\n",
+				func,
+				(irqs & 0x60) >> 5,
+				irqs & 7,
+				data,
+				ctrl,
+				cmd,
+				query);
+		addr -= 6;
+		ret = synaptics_i2c_read(client, addr, &func, 1);
+		if (ret)
+			return -EIO;
+	}
+	if (off + count >= len)
+		*eof = 1;
+	if (len < off)
+		return 0;
+	if (len - off <= count) {
+		memcpy(page, buf + off, len - off);
+		return len - off;
+	} else {
+		memcpy(page, buf + off, count);
+		return count;
+	}
 }
 #endif
 
@@ -483,7 +792,7 @@ static int synaptics_ts_probe(
 	uint8_t buf1[9];
 	int ret = 0;
 	uint16_t max_x, max_y;
-	struct proc_dir_entry *dir, *refresh;
+	struct proc_dir_entry *dir, *refresh, *config, *pdt;
   ret = gpio_request(GPIO_TOUCH_EN_OUT, "touch voltage");
 	if (ret)
 	{	
@@ -649,6 +958,19 @@ static int synaptics_ts_probe(
 		refresh->read_proc  = proc_read_val;
 		refresh->write_proc = proc_write_val;
 	}
+#if (CONFIG_TOUCHSCREEN_SYNAPTICS_I2C_RMI_PDT != 0)
+	config = create_proc_entry("configuration", 0644, dir);
+	if (config) {
+		config->data = ts;
+		config->read_proc = proc_read_config;
+		config->write_proc = proc_write_config;
+	}
+	pdt = create_proc_entry("pdt", 0444, dir);
+	if (pdt) {
+		pdt->data = ts;
+		pdt->read_proc = proc_read_pdt;
+	}
+#endif
 	printk(KERN_INFO "synaptics_ts_probe: Start touchscreen %s in %s mode\n", ts->input_dev->name, ts->use_irq ? "interrupt" : "polling");
 
 #ifdef TS_KEY_REPORT
@@ -708,6 +1030,7 @@ static int synaptics_ts_suspend(struct i2c_client *client, pm_message_t mesg)
 	        printk(KERN_ERR "synaptics_ts_suspend: synaptics_i2c_write failed\n");
 
 	gpio_direction_output(GPIO_TOUCH_EN_OUT, 0);
+	ts->is_suspended = 1;
 	return 0;
 }
 
@@ -730,6 +1053,7 @@ static int synaptics_ts_resume(struct i2c_client *client)
         	synaptics_i2c_write(ts->client, 0x26, 0x07);
 	    	synaptics_i2c_write(ts->client, 0x31, 0x7F);
 	}
+	ts->is_suspended = 0;
 	return 0;
 }
 
